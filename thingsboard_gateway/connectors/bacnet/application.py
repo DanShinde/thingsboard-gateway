@@ -18,7 +18,7 @@ from bacpypes3.ipv4.app import NormalApplication, ForeignApplication
 from bacpypes3.local.device import DeviceObject
 from bacpypes3.pdu import Address, IPv4Address
 from bacpypes3.primitivedata import ObjectIdentifier, Unsigned
-from bacpypes3.basetypes import PropertyIdentifier, ReadAccessSpecification
+from bacpypes3.basetypes import ErrorType, PropertyIdentifier, ReadAccessSpecification
 from bacpypes3.vendor import get_vendor_info
 from bacpypes3.constructeddata import SequenceOf, Array
 from bacpypes3.apdu import (
@@ -30,7 +30,8 @@ from bacpypes3.apdu import (
     SimpleAckPDU,
     ErrorRejectAbortNack,
     ReadPropertyMultipleRequest,
-    ReadPropertyMultipleACK
+    ReadPropertyMultipleACK,
+    RejectReason
 )
 from bacpypes3.comm import bind
 
@@ -221,14 +222,35 @@ class Application(NormalApplication, ForeignApplication):
             self.__log.warning("no read access specifications")
             return []
 
+        if not device.details.read_property_multiple_supported:
+            return await self.__read_objects_one_by_one(device, read_access_specifications)
+
         request = ReadPropertyMultipleRequest(
             **{RPM_REQUEST_SPECS_FIELD: SequenceOf(ReadAccessSpecification)(read_access_specifications)},
             destination=Address(device.details.address),
         )
 
-        result = await self.__send_request_wrapper(self.request,
-                                                   err_msg=f"Failed to read {device.details.object_id} objects",
-                                                   apdu=request)
+        err_msg = f"Failed to read {device.details.object_id} objects"
+        try:
+            result = await self.request(request)
+        except RejectPDU as e:
+            if e.reason != RejectReason.unrecognizedService:
+                self.__log.warning("(Request rejected) %s: %s", err_msg, e)
+                return []
+
+            self.__log.warning("Device %s does not support ReadPropertyMultiple, "
+                               "falling back to ReadProperty requests", device.details.object_id)
+            device.details.read_property_multiple_supported = False
+            return await self.__read_objects_one_by_one(device, read_access_specifications)
+        except AbortPDU as e:
+            self.__log.warning("(Request aborted) %s: %s", err_msg, e)
+            return []
+        except ErrorRejectAbortNack as e:
+            self.__log.warning("(Request rejected) %s: %s", err_msg, e)
+            return []
+        except Exception as e:
+            self.__log.error("(Unexpected error in request) %s: %s", err_msg, e)
+            return []
 
         if not isinstance(result, ReadPropertyMultipleACK):
             self.__log.error("Invalid response type: %s", type(result))
@@ -237,6 +259,48 @@ class Application(NormalApplication, ForeignApplication):
         decoded_result = self.decode_tag_list(result, device.details.vendor_id)
 
         return decoded_result
+
+    async def __read_objects_one_by_one(self, device, read_access_specifications):
+        """
+        Read every property with a separate ReadProperty request, for devices
+        that reject ReadPropertyMultiple with "unrecognized-service".
+        The result has the same shape as decode_tag_list().
+        """
+        result_list = []
+
+        for ras in read_access_specifications:
+            object_identifier = ras.objectIdentifier
+            for property_reference in ras.listOfPropertyReferences:
+                property_identifier = property_reference.propertyIdentifier
+                property_array_index = property_reference.propertyArrayIndex
+
+                if property_identifier in (PropertyIdentifier.all, PropertyIdentifier.required,
+                                           PropertyIdentifier.optional):
+                    self.__log.warning("Property %s of %s can only be read with ReadPropertyMultiple, skipping",
+                                       property_identifier, object_identifier)
+                    continue
+
+                try:
+                    value = await self.read_property(address=device.details.address,
+                                                     objid=object_identifier,
+                                                     prop=property_identifier,
+                                                     array_index=property_array_index)
+                except ErrorRejectAbortNack as e:
+                    value = e
+                except Exception as e:
+                    self.__log.error("Failed to read %s %s of %s: %s", object_identifier, property_identifier,
+                                     device.details.object_id, e)
+                    continue
+
+                if isinstance(value, ErrorRejectAbortNack):
+                    self.__log.warning("Failed to read %s %s of %s: %s", object_identifier, property_identifier,
+                                       device.details.object_id, value)
+                    value = ErrorType(errorClass=getattr(value, 'errorClass', 'property'),
+                                      errorCode=getattr(value, 'errorCode', 'other'))
+
+                result_list.append((object_identifier, property_identifier, property_array_index, value))
+
+        return result_list
 
     async def get_device_objects(self, device, with_all_properties=False, index_to_read=None):
         if device.details.is_segmentation_supported():

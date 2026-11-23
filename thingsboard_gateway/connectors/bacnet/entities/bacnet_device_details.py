@@ -35,6 +35,8 @@ class BACnetDeviceDetails:
 
         self.__objects_len = 0
         self.__failed_to_read_indexes = set()
+        # Set to False once the device rejects ReadPropertyMultiple as an unrecognized service
+        self.read_property_multiple_supported = True
 
     def __str__(self):
         return (f"DeviceDetails(address={self.address}, objectIdentifier={self.__object_identifier}, "
